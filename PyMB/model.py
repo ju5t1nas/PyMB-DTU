@@ -20,16 +20,88 @@ try:
 except:
     from scikits.sparse.cholmod import cholesky
 
+from rpy2.robjects import r
+
+# !!!!!!!!!
+rin.R_HOME = r('Sys.getenv("R_HOME")') # This is a bit ugly, but I think new versions of rpy2 don't automatically set this.
+# !!!!!!!!!
 
 __all__ = ['get_R_attr', 'check_R_TMB', 'model']
+
+R_script_structure_parameters = '''
+structure_parameters <- function(parameters) {
+  # Make map list for fixed parameters
+  fixed_parms <- names(which(
+    sapply(parameters, function(x) length(x) == 3 && (x[1] == x[2] & x[2] == x[3]))
+  ))
+  # if (length(fixed_parms) > 0) {
+  string_arg <- paste0("list(",
+                       paste(fixed_parms, rep("= factor(NA)", length(fixed_parms)), collapse = ", "),
+                       ")")
+  map <- eval(parse(text = string_arg))
+  
+  # }
+  
+  # Make vector of random variables
+  random_parms <- names(which(sapply(parameters, function(x) length(x) > 3)))
+  
+  # Make upper and lower bounds
+  bounded_parms <- names(parameters)[!names(parameters) %in% c(fixed_parms, random_parms)]
+  
+  bounded_parms_lower <- rep(-Inf, length(bounded_parms))
+  names(bounded_parms_lower) <- bounded_parms
+  bounded_parms_upper <- rep(Inf, length(bounded_parms))
+  names(bounded_parms_upper) <- bounded_parms
+  
+  bound_to_modify <- names(which(sapply(parameters[bounded_parms], function(x) length(x) > 1)))
+  for (i in seq_along(bound_to_modify)) {
+    bounded_parms_lower[bound_to_modify[i]] <-  parameters[[bound_to_modify[i]]][2]
+    bounded_parms_upper[bound_to_modify[i]] <-  parameters[[bound_to_modify[i]]][3]
+  }
+
+  # Make list of initial parameters
+  par_init <- list()
+  for (i in seq_along(parameters)) {
+    if (length(parameters[[i]]) > 3) {
+      par_init <- append(par_init, parameters[i])
+    } else {
+      par_init <- append(par_init, parameters[[i]][1])
+    }
+  }
+  names(par_init) <- names(parameters)
+  
+  # par_names <- names(which(sapply(parameters, function(x) length(x) <= 3)))
+  # par_init <- lapply(par_init[par_names], function(x) x[1])
+  
+  return(list(
+    random = random_parms,
+    map = map,
+    par = par_init,
+    lb = bounded_parms_lower,
+    ub = bounded_parms_upper))
+}
+'''
+# We import R function into the R environment
+ro.r(R_script_structure_parameters)
 
 
 def get_R_attr(obj, attr):
     '''
     Convenience function to return a named attribute from an R object (ListVector)
     e.g. get_R_attr(myModel.TMB.model, 'hessian') would return the equivalent of model$hessian
+    Updated to work with the latest rpy2 where R objects can be accessed like Python dictionaries.
+
+    Updated by: Justinas Smertinas
     '''
-    return obj[obj.names.index(attr)]
+    # Check if 'attr' is directly accessible as a key (for newer rpy2 versions)
+    if attr in obj.names:
+        return obj.rx2(attr)
+    else:
+        # Fallback for older rpy2 versions or other object types
+        try:
+            return obj[obj.names.index(attr)]
+        except (AttributeError, ValueError):
+            raise AttributeError(f"Attribute '{attr}' not found in the object.")
 
 
 def check_R_TMB():
@@ -291,7 +363,8 @@ class model:
             raise Exception('''Missing the following {thing}: {missing}\n
                 Assign via e.g. myModel.{thing}["a"] = np.array(1., 2., 3.)'''.format(thing=thing, missing=missing))
 
-    def build_objective_function(self, random=[], hessian=True, **kwargs):
+
+    def build_objective_function(self, random=[], hessian=True, params = None, **kwargs):
         '''
         Builds the model objective function
         Parameters
@@ -319,6 +392,40 @@ class model:
             except:
                 pass
 
+
+        # Initialize 'parmeters' in R.
+        #-----------------------------------------
+        # We are doing it this way because the regular way of specifying parameters in PyMB didn't work.
+        # So I wrote a function in R, to set them up in a nice way to be used by nlminb or nloptr.
+        # The function is called 'structure_parameters' and is defined in the R_script_structure_parameters variable.
+        #-----------------------------------------
+        # author: Justinas Smertinas
+        if params is not None:
+            # We split the keys and values of the parameters
+            keys = list(params.keys())
+            values = list(params.values())
+
+            # We check if the values are a list of lists
+            if all(isinstance(i, list) for i in values):
+                # We import them into R as key = c(value, lower, upper)
+                self.R.r('parameters <- list()')
+                for i in range(len(keys)):
+                    self.R.r(f'parameters[["{keys[i]}"]] <- c({", ".join(map(str, values[i]))})')
+            else:
+                # We set the lower and upper bounds to -Inf and Inf
+                self.R.r('parameters <- list()')
+                for i in range(len(keys)):
+                    self.R.r(f'parameters[["{keys[i]}"]] <- c({values[i]}, -Inf, Inf)')
+        else:
+            self.R.r('parameters <- list()')
+            for key, value in self.init.items():
+                self.R.r(f'parameters[["{key}"]] <- c({value}, -Inf, Inf)')
+        
+        # We call the function to structure the parameters.
+        self.R.r('struct_par = structure_parameters(parameters)')
+
+        #-----------------------------------------
+        
         # save the names of random effects
         if random or not hasattr(self, 'random'):
             random.sort()
@@ -331,13 +438,71 @@ class model:
         # store a list of fixed effects (any parameter that is not random)
         self.fixed = [v for v in self.init.keys() if v not in self.random]
 
-        # build the objective function
-        self.TMB.model = self.TMB.MakeADFun(data=self.R.ListVector(self.data),
-                                            parameters=self.R.ListVector(self.init), hessian=hessian,
-                                            DLL=self.dll, **kwargs)
+        # (old) build the objective function.
+        #-----------------------------------------
+        # This is the old way of building the objective function.
+        # It is not used anymore, because it fails.
+        #-----------------------------------------
+        #self.TMB.model = self.TMB.MakeADFun(data=self.R.ListVector(self.data),
+        #                                    parameters=self.R.ListVector(self.init), 
+        #                                    hessian=hessian,
+        #                                    DLL=self.dll, **kwargs)
+        #-----------------------------------------
+
+        # (NEW) We build the objective function.
+        #-----------------------------------------
+        # We add self.data to R as data_list.
+        self.r_data = self.R.ListVector(self.data)
+        self.R.globalenv['data_list'] = self.r_data
+
+
+        # We must converst self.filepath to a format that R can understand.
+        self.filepath_for_R = self.filepath.replace("\\", "/")
+        # and maybe add a tilde in front of the path.
+        if self.filepath_for_R[0] != "~":
+            self.filepath_for_R = "~" + self.filepath_for_R
+
+
+        # We add filepath to R as filepath.
+        self.R.globalenv['filepath'] = self.filepath_for_R
+        self.R.globalenv['model_dll'] = self.dll
+
+        self.R.r(f'filepath_no_cpp <- sub(".cpp", "", "{self.filepath_for_R}")')
+        self.R.r('try(dyn.unload(filepath_no_cpp), silent=TRUE)')
+
+        # We add self.dll to R as model_dll.
+        self.R.r('dyn.load(dynlib(filepath_no_cpp))')
+
+        # We add hessian to R as hessian_indicator.
+        self.r_hessian = self.R.BoolVector([hessian])
+        self.R.globalenv['hessian_indicator'] = self.r_hessian
+
+        self.R.r('''
+                 
+        # We get the model_dll from the filepath.
+        
+
+
+        model <- MakeADFun(
+                 data = data_list,
+                 parameters = struct_par$par,
+                 DLL = model_dll,
+                 hessian = TRUE,
+                 random = struct_par$random,
+                 map = struct_par$map,
+                 silent = TRUE
+                 )
+        ''')
+
+        self.model = self.R.r('model')
+
+        self.TMB.model = self.model
+        #print(get_R_attr(self.TMB.model, 'par'))
 
         # set obj_fun_built
         self.obj_fun_built = True
+
+
 
     def optimize(self, opt_fun='nlminb', method='L-BFGS-B', draws=100, verbose=False,
                  random=None, quiet=False, params=[], noparams=False, constrain=False, warning=True, **kwargs):
@@ -396,25 +561,37 @@ class model:
         # fit the model
         if quiet:
             self.R.r('sink("/dev/null")')
+
         self.TMB.fit = self.R.r[opt_fun](start=get_R_attr(self.TMB.model, 'par'),
                                          objective=get_R_attr(
                                              self.TMB.model, 'fn'),
                                          gradient=get_R_attr(
                                              self.TMB.model, 'gr'),
                                          method=method, **kwargs)
+        
+        # We print the results of the optimization
+        #print(self.TMB.fit)
+
         if quiet:
             self.R.r('sink()')
         else:
             print('\nModel optimization complete in {:.1f}s.\n'.format(
                 time.time()-start))
 
-        # check for convergence
-        self.convergence = self.TMB.fit[self.TMB.fit.names.index(
-            'convergence')][0]
+        # Check for convergence.
+        #-----------------------------------------
+        # we can't use the .index method for some reason. So I am hard-coding the index search.
+        # // Justinas Smertinas 
+        names = self.TMB.fit.names
+        idx_of_convergence = int(np.where(np.array(names) == 'convergence')[0][0])
+        self.convergence = self.TMB.fit[idx_of_convergence][0]
+        
         if warning and self.convergence != 0:
-            print(
-                '\nThe model did not successfully converge, exited with the following warning message:')
-            print(self.TMB.fit[self.TMB.fit.names.index('message')][0] + '\n')
+            print('\nThe model did not successfully converge, exited with the following warning message:')
+            # We have to hard-code the index search, because the .index method doesn't work.
+            # // Justinas Smertinas
+            idx_of_message = int(np.where(np.array(names) == 'message')[0][0])
+            print(self.TMB.fit[idx_of_message][0] + '\n')
 
         # simulate parameters
         if not quiet:
@@ -433,7 +610,7 @@ class model:
         '''
         return np.array(get_R_attr(get_R_attr(self.TMB.model, 'report')(), name))
 
-    def simulate_parameters(self, draws=100, params=[], quiet=False, constrain=False):
+    def simulate_parameters(self, draws=1000, params=[], quiet=False, constrain=False):
         '''
         Simulate draws from the posterior variance/covariance matrix of the fixed and random effects
         Stores draws in Model.parameters dictionary
@@ -456,21 +633,31 @@ class model:
         # use all parameters if none specified
         if len(params) == 0:
             params = self.fixed + self.random
-
+            print(params)
+        
         # start storing parameters
         self.parameters = {}
 
         # run sdreport to get everything in the right format
         if not self.random:
-            self.sdreport = self.TMB.sdreport(self.TMB.model, getJointPrecision=True,
-                                              hessian_fixed=get_R_attr(self.TMB.model, 'he')())
+            #self.sdreport = self.TMB.sdreport(self.TMB.model, 
+            #                                  getJointPrecision=True,
+            #                                  hessian_fixed=get_R_attr(self.TMB.model, 'he')())
+            
+            # We try it inside R 
+            self.R.r('sdreport_result = sdreport(model, getJointPrecision = TRUE)')
+            self.sdreport = self.R.r('sdreport_result')
         else:
-            self.sdreport = self.TMB.sdreport(
-                self.TMB.model, getJointPrecision=True)
+            #self.sdreport = self.TMB.sdreport(self.TMB.model, 
+            #                                  getJointPrecision=True)
+            
+            # We try it inside R
+            self.R.r('sdreport_result = sdreport(model, getJointPrecision = TRUE)')
+            self.sdreport = self.R.r('sdreport_result')
 
         # extraction convenience function
         # filters the object down to just a list of desired parameters
-        extract_params = self.R.r('''function(obj, nm, keepers) {
+        self.R.r('''extract_params = function(obj, nm, keepers) {
             ii <- nm %in% keepers;
             if (is.vector(obj)) {
                 return(obj[ii]);
@@ -478,14 +665,26 @@ class model:
                 return(obj[ii,ii]);
             };
         }''')
+        extract_params = self.R.r('extract_params')
 
         # extract the joint precision matrix
         if not self.random:
             joint_prec_full = self.R.r(
                 'function(m) { return(1./m) }')(get_R_attr(self.sdreport, 'cov.fixed'))
-            joint_prec_names = get_R_attr(self.sdreport, 'par.fixed').names
-            joint_prec_dense = extract_params(
-                joint_prec_full, joint_prec_names, params)
+            joint_prec_names = self.R.r('rownames')(joint_prec_full)
+            print(joint_prec_names)
+            #joint_prec_names = get_R_attr(self.sdreport, 'par.fixed').names
+            #joint_prec_dense = extract_params(joint_prec_full, 
+                                              #joint_prec_names, 
+                                              #params)
+
+            self.R.r('cov.fixed = sdreport_result$cov.fixed')
+
+            self.R.r('joint_prec_full = 1./cov.fixed')
+            self.R.r('joint_prec_names = names(model$par)')
+            self.R.r(f'params = c("{", ".join(params)}")')
+
+            joint_prec_dense = self.R.r('extract_params(joint_prec_full, joint_prec_names, params)')
             joint_prec_R = self.R.r('as')(joint_prec_dense, 'sparseMatrix')
         else:
             joint_prec_full = get_R_attr(self.sdreport, 'jointPrecision')
@@ -493,10 +692,12 @@ class model:
             joint_prec_R = extract_params(
                 joint_prec_full, joint_prec_names, params)
 
+
         # convert joint precision matrix to scipy.sparse.csc_matrix
         # (bypassing dense conversion step that happens if you use rpy2)
         def get_R_slot(obj, slot):
             return np.array(self.R.r('function(obj) {{ return(obj@{}) }}'.format(slot))(obj))
+        
         joint_prec = csc_matrix((get_R_slot(joint_prec_R, 'x'),
                                  get_R_slot(joint_prec_R, 'i'),
                                  get_R_slot(joint_prec_R, 'p')))

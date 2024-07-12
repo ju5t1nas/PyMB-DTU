@@ -1,5 +1,7 @@
 # PyMB
-Python Model Builder - fit statistical models using algorithmic differentiation
+Python Model Builder - DTU Edition.
+
+Fit statistical models using algorithmic differentiation... with quality of life improvements.
 
 [![Build Status](https://travis-ci.com/sadatnfs/PyMB.svg?branch=master)](https://travis-ci.com/sadatnfs/PyMB)
 
@@ -38,9 +40,18 @@ The user must have a working installation of R (http://www.r-project.org/) and t
 * [R](http://www.r-project.org/)
 * [TMB](https://github.com/kaskr/adcomp)
 * [rpy2](http://rpy.sourceforge.net/)
+  * Ok this can be a bit funky on Mac. You need to find RHOME directory, so run `R RHOME` in terminal, 
+  * Then `export R_HOME='wherever the directory is'` 
+  * And finally `pip install --upgrade --force-reinstall rpy2`.
 * [numpy](http://www.numpy.org/)
 * [scipy](https://scipy.org/)
 * [sksparse](https://github.com/scikit-sparse/scikit-sparse)
+  * This might also be funky on Mac. You need to install `suite-sparse`
+  * But then after you install it, you need to install `scikit-sparse`, usually it fails finding `suite-sparse`.
+  * So, we gotta find it... just run `brew list suite-sparse`. 
+  * For me it was in the following directories...
+  * So we put in the destinations and run `export SUITESPARSE_INCLUDE_DIR=/opt/homebrew/Cellar/suite-sparse/7.7.0/include/suitesparse/export SUITESPARSE_LIBRARY_DIR=/opt/homebrew/Cellar/suite-sparse/7.7.0/lib/`
+  * Lastly, `pip install scikit-sparse`.
 
 
 ## License (GPLv2)
