@@ -9,10 +9,15 @@ import time
 import warnings
 
 import numpy as np
+
 from rpy2.robjects.packages import importr
+from rpy2.robjects import pandas2ri
+
 from rpy2 import robjects as ro
 import rpy2.rinterface as rin
 import rpy2.robjects.numpy2ri
+
+
 from scipy.sparse import csc_matrix
 from scipy.sparse.linalg import spsolve
 try:
@@ -30,6 +35,7 @@ __all__ = ['get_R_attr', 'check_R_TMB', 'model']
 
 R_script_structure_parameters = '''
 structure_parameters <- function(parameters) {
+
   # Make map list for fixed parameters
   fixed_parms <- names(which(
     sapply(parameters, function(x) length(x) == 3 && (x[1] == x[2] & x[2] == x[3]))
@@ -419,7 +425,11 @@ class model:
         else:
             self.R.r('parameters <- list()')
             for key, value in self.init.items():
-                self.R.r(f'parameters[["{key}"]] <- c({value}, -Inf, Inf)')
+                # We check if it is a single value or a vector.
+                if len(value) > 1:
+                    self.R.r(f'parameters[["{key}"]] <- c({", ".join(map(str, value))})')
+                else:
+                    self.R.r(f'parameters[["{key}"]] <- c({value}, -Inf, Inf)')
         
         # We call the function to structure the parameters.
         self.R.r('struct_par = structure_parameters(parameters)')
@@ -452,16 +462,22 @@ class model:
         # (NEW) We build the objective function.
         #-----------------------------------------
         # We add self.data to R as data_list.
-        self.r_data = self.R.ListVector(self.data)
+
+        # But we gotta check if it is a list or pandas dataframe.
+        if isinstance(self.data, dict):
+            self.r_data = self.R.ListVector(self.data)
+        else:
+            with (ro.default_converter + pandas2ri.converter).context():
+                self.r_data = ro.conversion.get_conversion().py2rpy(self.data)
+
         self.R.globalenv['data_list'] = self.r_data
 
 
         # We must converst self.filepath to a format that R can understand.
         self.filepath_for_R = self.filepath.replace("\\", "/")
         # and maybe add a tilde in front of the path.
-        if self.filepath_for_R[0] != "~":
-            self.filepath_for_R = "~" + self.filepath_for_R
-
+        #if self.filepath_for_R[0] != "~":
+        #    self.filepath_for_R = "/" + self.filepath_for_R
 
         # We add filepath to R as filepath.
         self.R.globalenv['filepath'] = self.filepath_for_R
@@ -494,6 +510,8 @@ class model:
                  )
         ''')
 
+        self.struct_par = self.R.r('struct_par')
+
         self.model = self.R.r('model')
 
         self.TMB.model = self.model
@@ -505,7 +523,7 @@ class model:
 
 
     def optimize(self, opt_fun='nlminb', method='L-BFGS-B', draws=100, verbose=False,
-                 random=None, quiet=False, params=[], noparams=False, constrain=False, warning=True, **kwargs):
+                 random=None, quiet=False, params=[], noparams=True, constrain=False, warning=True, **kwargs):
         '''
         Optimize the model and store results in TMB_Model.TMB.fit
         Parameters
@@ -546,7 +564,7 @@ class model:
 
         # check to make sure the optimization function has been built
         if not hasattr(self.TMB, 'model') or rebuild:
-            self.build_objective_function(random=self.random)
+            self.build_objective_function(random=self.random)#, params=self.init)
 
         # turn off warnings if verbose is not on
         if not verbose:
@@ -562,13 +580,31 @@ class model:
         if quiet:
             self.R.r('sink("/dev/null")')
 
-        self.TMB.fit = self.R.r[opt_fun](start=get_R_attr(self.TMB.model, 'par'),
-                                         objective=get_R_attr(
-                                             self.TMB.model, 'fn'),
-                                         gradient=get_R_attr(
-                                             self.TMB.model, 'gr'),
-                                         method=method, **kwargs)
-        
+        if opt_fun == 'nlminb':
+            self.TMB.fit = self.R.r[opt_fun](start=get_R_attr(self.TMB.model, 'par'),
+                                            objective=get_R_attr(
+                                                self.TMB.model, 'fn'),
+                                            gradient=get_R_attr(
+                                                self.TMB.model, 'gr'),
+                                            method=method, **kwargs)
+        elif opt_fun == 'nloptr':
+            # We import the nloptr package
+            self.R.r('library(nloptr)')
+            self.R.r('''
+                     output <- nloptr(x0 = model$par,
+                                        eval_f = model$fn,
+                                        eval_grad_f = model$gr,
+                                        opts = list("algorithm" = "NLOPT_LD_LBFGS",
+                                                    "xtol_rel" = 1.0e-6,
+                                                    "ftol_rel" = 1.0e-6,
+                                                    "maxeval" = 1e6,
+                                                    print_level = 1,
+                                                    check_derivatives = TRUE),
+                                        lb = struct_par$lb,
+                                        ub = struct_par$ub,
+                                        ... = NA)
+                         ''')
+            self.TMB.fit = self.R.r('output')
         # We print the results of the optimization
         #print(self.TMB.fit)
 
@@ -583,7 +619,10 @@ class model:
         # we can't use the .index method for some reason. So I am hard-coding the index search.
         # // Justinas Smertinas 
         names = self.TMB.fit.names
-        idx_of_convergence = int(np.where(np.array(names) == 'convergence')[0][0])
+        if opt_fun == 'nlminb':
+            idx_of_convergence = int(np.where(np.array(names) == 'convergence')[0][0])
+        elif opt_fun == 'nloptr':
+            idx_of_convergence = int(np.where(np.array(names) == 'status')[0][0])
         self.convergence = self.TMB.fit[idx_of_convergence][0]
         
         if warning and self.convergence != 0:
