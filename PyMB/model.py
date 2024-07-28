@@ -599,7 +599,7 @@ class model:
                                                     "ftol_rel" = 1.0e-6,
                                                     "maxeval" = 1e6,
                                                     print_level = 1,
-                                                    check_derivatives = TRUE),
+                                                    check_derivatives = FALSE),
                                         lb = struct_par$lb,
                                         ub = struct_par$ub,
                                         ... = NA)
