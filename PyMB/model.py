@@ -242,7 +242,14 @@ class model:
         if filepath:
             self.filepath = os.path.join(
                 output_dir, '{name}.cpp'.format(name=self.name))
-            shutil.copy(filepath, self.filepath)
+            
+            # First we check if the file already exists, then we don't overwrite it.
+            if os.path.isfile(self.filepath):
+                print('File already exists. Keeping it the same...')
+                pass
+            else:
+                shutil.copy(filepath, self.filepath)
+
             if codestr:
                 warnings.warn(
                     'Both filepath and codestr specified. Ignoring codestr.')
@@ -345,6 +352,13 @@ class model:
         print('Compiled in {:.1f}s.\n'.format(time.time()-start))
 
     def load_model(self, so_file=''):
+        '''
+        Load the compiled model into R
+        Parameters
+        ----------
+        so_file : str, default ''
+            path to the shared object file.
+        '''
         if so_file == '':
             so_file = 'tmb_tmp/{name}.so'.format(name=self.name)
         if not hasattr(self, 'filepath'):
