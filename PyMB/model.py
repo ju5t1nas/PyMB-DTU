@@ -9,11 +9,15 @@ import time
 import warnings
 
 import numpy as np
+import pandas as pd
 
-from rpy2.robjects.packages import importr
-from rpy2.robjects import pandas2ri
 
 from rpy2 import robjects as ro
+
+from rpy2.robjects import pandas2ri, r
+from rpy2.robjects.packages import importr
+from rpy2.robjects.vectors import DataFrame, FloatVector, IntVector, StrVector, ListVector, Matrix
+
 import rpy2.rinterface as rin
 import rpy2.robjects.numpy2ri
 
@@ -25,7 +29,13 @@ try:
 except:
     from scikits.sparse.cholmod import cholesky
 
-from rpy2.robjects import r
+
+
+from collections import OrderedDict
+
+
+
+
 
 # !!!!!!!!!
 rin.R_HOME = r('Sys.getenv("R_HOME")') # This is a bit ugly, but I think new versions of rpy2 don't automatically set this.
@@ -904,3 +914,66 @@ class model:
                 print('{p}:\n\tmean\t{m}\n\tsd\t{s}\n\tdraws\tNone'.format(
                     p=p, m=v['mean'], s=v['sd']))
         np.set_printoptions(threshold=1000, edgeitems=3)
+
+
+    def sdreport(self, getJointPrecision=False):
+        '''
+        Obtains and returns the sdreport object from TMB.
+        ----------
+        Parameters
+        ----------
+        getJointPrecision : boolean, default False
+            whether to return the joint precision matrix
+        '''
+        if not self.obj_fun_built:
+            raise Exception('Objective function not yet built. See TMB_model.build_objective_function().')
+        
+        if getJointPrecision:
+            self.R.r('sdreport_result = sdreport(model, getJointPrecision = TRUE)')
+        else:
+            self.R.r('sdreport_result = sdreport(model, getJointPrecision = FALSE)')
+
+        sdreport_result = {}
+
+        sdreport_result['par.fixed'] = self.R.r('sdreport_result$par.fixed')
+        names_par_fixed = self.R.r('names(struct_par$par)')
+        # We join both into a dict
+        if len(names_par_fixed) == len(sdreport_result['par.fixed']):
+            sdreport_result['par.fixed'] = {names_par_fixed[i]: sdreport_result['par.fixed'][i] for i in range(len(names_par_fixed))}
+
+        # We implement this for random effects some other day....
+
+        self.sdreport_result = sdreport_result
+
+        return self.sdreport_result
+    
+
+def recurse_r_tree(data):
+    """
+    step through an R object recursively and convert the types to python types as appropriate. 
+    Leaves will be converted to e.g. numpy arrays or lists as appropriate and the whole tree to a dictionary.
+    
+    Original Author: user3324315 from StackOverflow, thanks buddy.
+    ---------------------
+    Parameters:
+    ---------------------
+    data : R object
+        The R object to convert to a python object.
+
+    """
+    r_dict_types = [DataFrame, ListVector]
+    r_array_types = [FloatVector, IntVector, Matrix]
+    r_list_types = [StrVector]
+    if type(data) in r_dict_types:
+        return OrderedDict(zip(data.names, [recurse_r_tree(elt) for elt in data]))
+    elif type(data) in r_list_types:
+        return [recurse_r_tree(elt) for elt in data]
+    elif type(data) in r_array_types:
+        return np.array(data)
+    else:
+        if hasattr(data, "rclass"):  # An unsupported r class
+            raise KeyError('Could not proceed, type {} is not defined'
+                           'to add support for this type, just add it to the imports '
+                           'and to the appropriate type list above'.format(type(data)))
+        else:
+            return data  # We reached the end of recursion
