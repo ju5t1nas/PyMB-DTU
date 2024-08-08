@@ -96,6 +96,38 @@ structure_parameters <- function(parameters) {
     lb = bounded_parms_lower,
     ub = bounded_parms_upper))
 }
+
+
+# Update model parameters
+update_model_prm <- function(model, output, model_prm) {
+  sdr <- sdreport(model)
+  # Only update if model passed check
+  #if(sdr$pdHess & output$status == 1) {
+    #  Save new initial values for next model
+    # Index of fixed parameters
+    idx_par <- sapply(sdr$env$parameters, function(x) {
+      a <- attr(x, which = "map")
+      length(a) == 0 & length(x) == 1
+    })
+    # Index of random parameter (Tb or UA)
+    idx_random <- which(lapply(model_prm, FUN = length) > 3)
+    
+    # Set random paramters
+    if (length(idx_random) > 0) {
+      model_prm[[idx_random]] <- sdr$par.random
+    }
+    
+    # Set fixed parameters
+    par.fixed <- sdr$par.fixed
+    names(par.fixed) <- names(idx_par)[idx_par]
+    for (i in seq_along(par.fixed)) {
+      j <- which(names(model_prm) %in% names(par.fixed[i]))
+      model_prm[[j]][1] <- par.fixed[i]
+    }
+  #}
+  return(model_prm)
+}
+
 '''
 # We import R function into the R environment
 ro.r(R_script_structure_parameters)
@@ -579,6 +611,8 @@ class model:
         # time function execution
         start = time.time()
 
+        self.opt_fun = opt_fun
+
         # rebuild optimization function if new random parameters are given
         rebuild = False
         if random is not None:
@@ -604,14 +638,14 @@ class model:
         if quiet:
             self.R.r('sink("/dev/null")')
 
-        if opt_fun == 'nlminb':
-            self.TMB.fit = self.R.r[opt_fun](start=get_R_attr(self.TMB.model, 'par'),
+        if self.opt_fun == 'nlminb':
+            self.TMB.fit = self.R.r[self.opt_fun](start=get_R_attr(self.TMB.model, 'par'),
                                             objective=get_R_attr(
                                                 self.TMB.model, 'fn'),
                                             gradient=get_R_attr(
                                                 self.TMB.model, 'gr'),
                                             method=method, **kwargs)
-        elif opt_fun == 'nloptr':
+        elif self.opt_fun == 'nloptr':
             # We import the nloptr package
             self.R.r('library(nloptr)')
             self.R.r('''
@@ -672,11 +706,61 @@ class model:
             the name of the reported parameter/quantity to return
         '''
         return np.array(get_R_attr(get_R_attr(self.TMB.model, 'report')(), name))
+    
+
+    def simulate(self, data_new = None):
+        '''
+        Simulates the time series data using the model and new input data.
+        Parameters
+        ----------
+        data_new : dict
+            the new data to use for simulation
+        
+        Returns
+        -------
+        y_hat : np.array
+            the simulated time series data
+        '''
+
+        # We add data_new to R as data_list.
+        if data_new is not None:
+            if isinstance(data_new, dict):
+                self.r_data_new = self.R.ListVector(data_new)
+            else:
+                with (ro.default_converter + pandas2ri.converter).context():
+                    self.r_data_new = ro.conversion.get_conversion().py2rpy(data_new)
+
+            self.R.globalenv['data_list_new'] = self.r_data_new
+        else:
+            self.R.globalenv['data_list_new'] = self.r_data
+
+
+        # We simulate the data.
+        self.R.r('''
+            new_prm = update_model_prm(model = model, 
+                                    output = output, 
+                                    model_prm = struct_par$par)
+
+            sim_model = MakeADFun(data = data_list,
+                                parameters = new_prm,
+                                DLL = model_dll,
+                                random = struct_par$random, 
+                                map = struct_par$map,
+                                silent = TRUE)
+
+            y_hat = sim_model$simulate()
+        ''')
+
+        # We return the simulated data.
+        return np.array(self.R.r('y_hat'))
+
+        
 
     def simulate_parameters(self, draws=1000, params=[], quiet=False, constrain=False):
         '''
         Simulate draws from the posterior variance/covariance matrix of the fixed and random effects
         Stores draws in Model.parameters dictionary
+        
         Parameters
         ----------
         draws : int or boolean, default 1000
